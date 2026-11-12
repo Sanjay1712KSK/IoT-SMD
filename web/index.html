@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Door Monitor</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --line: #2a333d; --text: #e6e9ec; --muted: #8b96a1;
+    --ok: #2fbf71; --bad: #e5484d; --warn: #f5a524; --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+           border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; flex: 1; min-width: 160px; }
+  nav button { background: none; border: 1px solid var(--line); color: var(--muted);
+               padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+  nav button.active { color: var(--text); border-color: var(--accent); }
+  .badge { padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .badge.on { background: rgba(47,191,113,.15); color: var(--ok); }
+  .badge.off { background: rgba(229,72,77,.15); color: var(--bad); }
+  main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  @media (max-width: 520px) {
+    header { padding: 10px 12px; gap: 8px; }
+    header h1 { flex-basis: 100%; }
+    main { padding: 10px; }
+    #events a.dl { padding: 5px 8px; }
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .panel h2 { font-size: 15px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  #feed { width: 100%; aspect-ratio: 4/3; object-fit: contain; background: #000; border-radius: 6px; display: block; }
+  #alert { display: none; background: var(--bad); color: #fff; padding: 12px 16px; border-radius: 10px;
+           margin-bottom: 16px; align-items: center; gap: 12px; flex-wrap: wrap; animation: pulse 1s 3; }
+  #alert.show { display: flex; }
+  #alert strong { flex: 1; font-size: 17px; }
+  @keyframes pulse { 50% { opacity: .6; } }
+  .btn { background: var(--accent); color: #fff; border: 0; padding: 7px 12px; border-radius: 6px;
+         cursor: pointer; font: inherit; text-decoration: none; display: inline-block; }
+  .btn.ghost { background: transparent; border: 1px solid currentColor; color: inherit; }
+  .btn.danger { background: var(--bad); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  #events { list-style: none; margin: 0; padding: 0; max-height: 70vh; overflow-y: auto; }
+  #events li { display: flex; gap: 10px; padding: 8px; border-bottom: 1px solid var(--line); align-items: center;
+               border-left: 3px solid transparent; }
+  #events .msg div:first-child { overflow-wrap: anywhere; }
+  #events li.unknown { background: rgba(229,72,77,.12); border-left: 3px solid var(--bad); }
+  #events li.known { border-left: 3px solid var(--ok); }
+  #events li.error { border-left: 3px solid var(--warn); }
+  #events img { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; background: #000; flex: none; cursor: pointer; }
+  #events .thumb-empty { width: 64px; height: 48px; flex: none; }
+  #events .msg { flex: 1; min-width: 0; }
+  #events .time { color: var(--muted); font-size: 12px; }
+  #events a.dl { font-size: 13px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input[type=text], input[type=password] { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+         padding: 7px 10px; border-radius: 6px; font: inherit; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); }
+  .muted { color: var(--muted); font-size: 13px; }
+  #msg { min-height: 1.4em; }
+  #login { max-width: 360px; margin: 10vh auto; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🚪 Smart Door Monitor</h1>
+  <nav><button data-tab="live" class="active">Live</button> <button data-tab="faces">Faces</button></nav>
+  <span id="status" class="badge off">offline</span>
+  <button id="enableAlerts" class="btn ghost" title="Browsers only allow sound/notifications after a click">🔔 Enable alerts</button>
+</header>
+
+<main>
+  <div id="login" class="panel hidden">
+    <h2>Enter access token</h2>
+    <p class="muted">The API_TOKEN from the server's .env file.</p>
+    <div class="row"><input id="tokenInput" type="password" placeholder="token" style="flex:1">
+      <button class="btn" id="tokenSave">Open</button></div>
+  </div>
+
+  <section id="tab-live">
+    <div id="alert">
+      <strong>⚠️ Unknown person at your door</strong>
+      <a id="alertDl" class="btn ghost" href="#">Download image</a>
+      <button class="btn ghost" id="alertClose">Dismiss</button>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <h2>Live feed</h2>
+        <img id="feed" alt="Live camera feed">
+      </div>
+      <div class="panel">
+        <h2>Event history</h2>
+        <ul id="events"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-faces" class="hidden">
+    <div class="grid">
+      <div class="panel">
+        <h2>Add a known person</h2>
+        <div class="row"><input id="personName" type="text" placeholder="Name (e.g. Alice)" maxlength="31" style="flex:1"></div>
+        <div class="row">
+          <input id="files" type="file" accept="image/*" multiple>
+          <button class="btn" id="upload">Upload photos</button>
+        </div>
+        <div class="row">
+          <button class="btn ghost" id="capture">📷 Capture from door camera</button>
+          <span class="muted">Stand in front of the camera, click a few times while turning your head slightly.</span>
+        </div>
+        <p id="msg" class="muted"></p>
+        <p class="muted">Tip: 5–10 clear, well-lit photos per person, one face per photo.</p>
+      </div>
+      <div class="panel">
+        <h2>Known people</h2>
+        <table><tbody id="people"></tbody></table>
+        <div class="row" style="margin-top:10px"><button class="btn ghost" id="reload">Reload faces from disk</button></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// ---------- token handling: ?token=... in the URL is saved once, then removed from the address bar
+const qs = new URLSearchParams(location.search);
+if (qs.get("token")) {
+  try { localStorage.setItem("doorToken", qs.get("token")); } catch (e) {}
+  history.replaceState(null, "", location.pathname);
+}
+let token = "";
+try { token = localStorage.getItem("doorToken") || ""; } catch (e) {}
+const withToken = (url) => token ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : url;
+const $ = (id) => document.getElementById(id);
+
+async function api(url, opts = {}) {
+  const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), "X-Token": token } });
+  if (res.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  const body = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
+  if (!res.ok) throw new Error(body.detail || body || res.statusText);
+  return body;
+}
+
+function showLogin() {
+  $("login").classList.remove("hidden");
+  $("tab-live").classList.add("hidden");
+  $("tab-faces").classList.add("hidden");
+}
+$("tokenSave").onclick = () => {
+  token = $("tokenInput").value.trim();
+  try { localStorage.setItem("doorToken", token); } catch (e) {}
+  location.reload();
+};
+
+// ---------- tabs
+document.querySelectorAll("nav button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach((x) => x.classList.toggle("active", x === b));
+  $("tab-live").classList.toggle("hidden", b.dataset.tab !== "live");
+  $("tab-faces").classList.toggle("hidden", b.dataset.tab !== "faces");
+  if (b.dataset.tab === "faces") loadPeople();
+});
+
+// ---------- alerts: sound (Web Audio, no file needed) + browser notification
+let audioCtx = null;
+$("enableAlerts").onclick = async () => {
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission();
+  $("enableAlerts").textContent = "🔔 Alerts on";
+  $("enableAlerts").disabled = true;
+  beep(1);
+};
+function beep(times = 3) {
+  if (!audioCtx) return;
+  for (let i = 0; i < times; i++) {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = "square"; o.frequency.value = 880;
+    g.gain.value = 0.15;
+    o.connect(g).connect(audioCtx.destination);
+    const t = audioCtx.currentTime + i * 0.35;
+    o.start(t); o.stop(t + 0.2);
+  }
+}
+function notify(ev) {
+  beep(3);
+  const dl = ev.snapshot ? withToken("/snapshots/" + ev.snapshot + "?download=1") : "#";
+  $("alertDl").href = dl;
+  $("alertDl").classList.toggle("hidden", !ev.snapshot);
+  $("alert").classList.add("show");
+  if ("Notification" in window && Notification.permission === "granted") {
+    const n = new Notification("Unknown person at your door", {
+      body: new Date(ev.ts * 1000).toLocaleTimeString(),
+      icon: ev.snapshot ? withToken("/snapshots/" + ev.snapshot) : undefined,
+      tag: "door-unknown",
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  }
+}
+$("alertClose").onclick = () => $("alert").classList.remove("show");
+
+// ---------- event log (polls /events?after=<last id> every second)
+let lastId = 0, firstLoad = true;
+const MAX_ITEMS = 200;
+function renderEvent(ev) {
+  const li = document.createElement("li");
+  li.className = ev.kind;
+  if (ev.snapshot) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = withToken("/snapshots/" + ev.snapshot);
+    img.onerror = () => img.replaceWith(Object.assign(document.createElement("div"), { className: "thumb-empty" }));
+    img.onclick = () => window.open(img.src, "_blank");
+    li.appendChild(img);
+  } else {
+    li.appendChild(Object.assign(document.createElement("div"), { className: "thumb-empty" }));
+  }
+  const msg = document.createElement("div");
+  msg.className = "msg";
+  const title = document.createElement("div");
+  title.textContent = ev.message;           // textContent: never inject names as HTML
+  const time = document.createElement("div");
+  time.className = "time";
+  time.textContent = new Date(ev.ts * 1000).toLocaleString() + (ev.distance != null ? ` · ${Math.round(ev.distance)} cm` : "");
+  msg.append(title, time);
+  li.appendChild(msg);
+  if (ev.snapshot) {
+    const a = document.createElement("a");
+    a.className = "dl btn ghost";
+    a.textContent = "Download";
+    a.href = withToken("/snapshots/" + ev.snapshot + "?download=1");
+    li.appendChild(a);
+  }
+  const list = $("events");
+  list.prepend(li);
+  while (list.children.length > MAX_ITEMS) list.lastChild.remove();
+}
+async function pollEvents() {
+  try {
+    const evs = await api("/events?after=" + lastId);
+    for (const ev of evs) {
+      renderEvent(ev);
+      lastId = Math.max(lastId, ev.id);
+      if (!firstLoad && ev.kind === "unknown") notify(ev);   // don't alert for old history
+    }
+    firstLoad = false;
+  } catch (e) { /* server down: status badge shows it */ }
+  setTimeout(pollEvents, 1000);
+}
+
+// ---------- status badge + live video (reconnects if the server restarts)
+let wasOnline = null;
+async function pollHealth() {
+  let camOk = false, serverOk = false;
+  try {
+    const h = await (await fetch("/health", { cache: "no-store" })).json();
+    serverOk = true; camOk = h.camera_online;
+  } catch (e) {}
+  const s = $("status");
+  s.className = "badge " + (camOk ? "on" : "off");
+  s.textContent = !serverOk ? "server offline" : camOk ? "camera online" : "camera offline";
+  if (serverOk && wasOnline === false) $("feed").src = withToken("/video?ts=" + Date.now());
+  wasOnline = serverOk;
+  setTimeout(pollHealth, 3000);
+}
+$("feed").onerror = () => setTimeout(() => $("feed").src = withToken("/video?ts=" + Date.now()), 2000);
+
+// ---------- faces page
+const say = (t) => $("msg").textContent = t;
+async function loadPeople() {
+  try {
+    const data = await api("/api/faces");
+    const tb = $("people");
+    tb.replaceChildren();
+    if (!data.people.length) tb.innerHTML = '<tr><td class="muted">Nobody enrolled yet.</td></tr>';
+    for (const p of data.people) {
+      const tr = document.createElement("tr");
+      const name = document.createElement("td"); name.textContent = p.name;
+      const n = document.createElement("td"); n.textContent = p.photos + " photos"; n.className = "muted";
+      const act = document.createElement("td");
+      const del = Object.assign(document.createElement("button"), { className: "btn danger", textContent: "Delete" });
+      del.onclick = async () => {
+        if (!confirm(`Delete ${p.name} and all their photos?`)) return;
+        try { await api("/api/faces/" + encodeURIComponent(p.name), { method: "DELETE" }); say(`Deleted ${p.name}.`); }
+        catch (e) { say("Error: " + e.message); }
+        loadPeople();
+      };
+      act.appendChild(del);
+      tr.append(name, n, act);
+      tb.appendChild(tr);
+    }
+  } catch (e) { say("Error: " + e.message); }
+}
+function nameOrWarn() {
+  const n = $("personName").value.trim();
+  if (!n) say("Enter a name first.");
+  return n;
+}
+$("upload").onclick = async () => {
+  const name = nameOrWarn(); if (!name) return;
+  const files = $("files").files;
+  if (!files.length) return say("Choose one or more photos.");
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  say("Uploading and checking faces...");
+  try {
+    const r = await api("/api/faces/" + encodeURIComponent(name), { method: "POST", body: fd });
+    say(`Saved ${r.saved} photo(s).` + (r.rejected.length ? " Rejected: " + r.rejected.join("; ") : ""));
+    $("files").value = "";
+  } catch (e) { say("Error: " + e.message); }
+  loadPeople();
+};
+$("capture").onclick = async () => {
+  const name = nameOrWarn(); if (!name) return;
+  $("capture").disabled = true;
+  try {
+    const r = await api("/api/faces/" + encodeURIComponent(name) + "/capture", { method: "POST" });
+    say(`Captured. ${name} now has ${r.loaded[name] || 0} usable photo(s).`);
+  } catch (e) { say("Error: " + e.message); }
+  $("capture").disabled = false;
+  loadPeople();
+};
+$("reload").onclick = async () => {
+  say("Reloading...");
+  try { const r = await api("/api/faces/reload", { method: "POST" }); say("Loaded: " + JSON.stringify(r.loaded)); }
+  catch (e) { say("Error: " + e.message); }
+  loadPeople();
+};
+
+// ---------- start
+(async () => {
+  const h = await fetch("/health").then((r) => r.json()).catch(() => ({}));
+  if (h.auth_required && !token) return showLogin();
+  $("feed").src = withToken("/video");
+  pollEvents();
+  pollHealth();
+})();
+</script>
+</body>
+</html>

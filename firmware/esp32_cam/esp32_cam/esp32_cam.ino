@@ -1,0 +1,272 @@
+/*
+  Smart Door Monitor - ESP32-CAM (AI Thinker, OV2640): camera + WiFi ONLY, no decisions.
+
+  1. MJPEG stream:   http://<ip>:81/stream      (the laptop backend reads this)
+     Single photo:   http://<ip>/capture        Status page: http://<ip>/
+  2. Serial relay (UART0 = U0R/U0T pins, 9600 baud, newline-terminated):
+        Arduino -> "T,<cm>"  -> HTTP GET <BACKEND_URL>/trigger?d=<cm>&token=<API_TOKEN>
+        reply line -> Arduino  ("KNOWN:<name>", "UNKNOWN", "NOFACE", or "ERR" if anything fails)
+     After WiFi connects it also sends "IP:<address>" once, so the Arduino LCD can show the IP.
+
+  Because UART0 is the Arduino link, NO debug output is printed (it would confuse the Arduino).
+
+  Red LED (GPIO33, on the back) status:
+     fast blink         = connecting to WiFi
+     3 long blinks      = WiFi connected, stream running
+     slow blink (1 Hz)  = WiFi lost, reconnecting
+     rapid double blink = camera init failed (check ribbon cable / power) -> reboots after 10 s
+     short flicker      = relayed a trigger
+
+  Based on Espressif's CameraWebServer example, trimmed to what we need.
+  Board settings: see docs/wiring.md (AI Thinker ESP32-CAM, PSRAM enabled, Core Debug Level: None).
+  Works with ESP32 Arduino core 2.0.x and 3.x.
+*/
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include "secrets.h"   // copy secrets.h.example -> secrets.h and fill in (not committed to git)
+
+// ---------------- AI Thinker ESP32-CAM pin map ----------------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define LED_PIN           33   // small red LED, active LOW
+
+#ifndef MDNS_NAME
+#define MDNS_NAME "doorcam"     // -> http://doorcam.local:81/stream
+#endif
+
+static const unsigned long HTTP_TIMEOUT_MS = 6000;   // Arduino waits 10 s, so stay well below that
+
+httpd_handle_t streamHttpd = NULL;
+httpd_handle_t webHttpd = NULL;
+
+// ---------------------------------------------------------------- LED helpers
+void led(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
+void blink(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) { led(true); delay(onMs); led(false); delay(offMs); }
+}
+
+// ---------------------------------------------------------------- camera
+bool initCamera() {
+  camera_config_t c = {};
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.ledc_timer = LEDC_TIMER_0;
+  c.pin_d0 = Y2_GPIO_NUM;  c.pin_d1 = Y3_GPIO_NUM;  c.pin_d2 = Y4_GPIO_NUM;  c.pin_d3 = Y5_GPIO_NUM;
+  c.pin_d4 = Y6_GPIO_NUM;  c.pin_d5 = Y7_GPIO_NUM;  c.pin_d6 = Y8_GPIO_NUM;  c.pin_d7 = Y9_GPIO_NUM;
+  c.pin_xclk = XCLK_GPIO_NUM;
+  c.pin_pclk = PCLK_GPIO_NUM;
+  c.pin_vsync = VSYNC_GPIO_NUM;
+  c.pin_href = HREF_GPIO_NUM;
+  c.pin_sccb_sda = SIOD_GPIO_NUM;
+  c.pin_sccb_scl = SIOC_GPIO_NUM;
+  c.pin_pwdn = PWDN_GPIO_NUM;
+  c.pin_reset = RESET_GPIO_NUM;
+  c.xclk_freq_hz = 20000000;
+  c.pixel_format = PIXFORMAT_JPEG;        // the sensor compresses for us -> cheap to stream
+  c.grab_mode = CAMERA_GRAB_LATEST;       // always send the newest frame (low latency)
+  if (psramFound()) {
+    c.frame_size = FRAMESIZE_VGA;         // 640x480: good balance of face size vs. WiFi bandwidth
+    c.jpeg_quality = 12;                  // 0-63, lower = better quality
+    c.fb_count = 2;
+    c.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    c.frame_size = FRAMESIZE_QVGA;
+    c.jpeg_quality = 15;
+    c.fb_count = 1;
+    c.fb_location = CAMERA_FB_IN_DRAM;
+  }
+  if (esp_camera_init(&c) != ESP_OK) return false;
+
+  sensor_t* s = esp_camera_sensor_get();
+  // Uncomment if the image is upside down / mirrored for your mounting:
+  // s->set_vflip(s, 1);
+  // s->set_hmirror(s, 1);
+  s->set_brightness(s, 1);
+  return true;
+}
+
+// ---------------------------------------------------------------- HTTP handlers
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static esp_err_t streamHandler(httpd_req_t* req) {
+  char partBuf[64];
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  while (true) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) return ESP_FAIL;
+    size_t hlen = snprintf(partBuf, sizeof(partBuf), STREAM_PART, (unsigned)fb->len);
+    res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, partBuf, hlen);
+    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    if (res != ESP_OK) return res;   // client disconnected -> end this stream
+  }
+}
+
+static esp_err_t captureHandler(httpd_req_t* req) {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+  httpd_resp_set_type(req, "image/jpeg");
+  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+static esp_err_t indexHandler(httpd_req_t* req) {
+  char page[256];
+  snprintf(page, sizeof(page),
+           "ESP32-CAM door camera OK\nstream:  http://%s:81/stream\ncapture: http://%s/capture\nbackend: %s\nRSSI: %d dBm\n",
+           WiFi.localIP().toString().c_str(), WiFi.localIP().toString().c_str(), BACKEND_URL, WiFi.RSSI());
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_send(req, page, strlen(page));
+}
+
+void startServers() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 80;
+  httpd_uri_t indexUri = {"/", HTTP_GET, indexHandler, NULL};
+  httpd_uri_t captureUri = {"/capture", HTTP_GET, captureHandler, NULL};
+  if (httpd_start(&webHttpd, &cfg) == ESP_OK) {
+    httpd_register_uri_handler(webHttpd, &indexUri);
+    httpd_register_uri_handler(webHttpd, &captureUri);
+  }
+  // The stream gets its own server (port 81) because a stream request never finishes.
+  cfg.server_port = 81;
+  cfg.ctrl_port += 1;
+  httpd_uri_t streamUri = {"/stream", HTTP_GET, streamHandler, NULL};
+  if (httpd_start(&streamHttpd, &cfg) == ESP_OK) {
+    httpd_register_uri_handler(streamHttpd, &streamUri);
+  }
+}
+
+// ---------------------------------------------------------------- WiFi
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                 // power-save adds lag/stutter to the stream
+  WiFi.setAutoReconnect(true);
+#ifdef STATIC_IP
+  IPAddress ip, gw, mask(255, 255, 255, 0);
+  ip.fromString(STATIC_IP); gw.fromString(STATIC_GATEWAY);
+  WiFi.config(ip, gw, mask, gw);
+#endif
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) blink(1, 50, 150);
+}
+
+void announceIP() {
+  Serial.print("IP:");
+  Serial.println(WiFi.localIP());
+}
+
+unsigned long lastWifiCheck = 0, lastSlowBlink = 0;
+bool wasConnected = false;
+
+void maintainWiFi() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  unsigned long now = millis();
+  if (connected && !wasConnected) {      // just (re)connected
+    blink(3, 400, 200);
+    announceIP();
+  }
+  wasConnected = connected;
+  if (connected) return;
+  if (now - lastSlowBlink >= 500) { lastSlowBlink = now; digitalWrite(LED_PIN, !digitalRead(LED_PIN)); }
+  if (now - lastWifiCheck >= 10000) {    // nudge a reconnect every 10 s
+    lastWifiCheck = now;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+}
+
+// ---------------------------------------------------------------- serial relay
+bool validReply(const String& r) {
+  return r == "UNKNOWN" || r == "NOFACE" || r == "ERR" || (r.startsWith("KNOWN:") && r.length() > 6);
+}
+
+String askBackend(const String& distance) {
+  if (WiFi.status() != WL_CONNECTED) return "ERR";
+  HTTPClient http;
+  String url = String(BACKEND_URL) + "/trigger?d=" + distance + "&token=" + API_TOKEN;
+  http.setConnectTimeout(3000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(url)) return "ERR";
+  String reply = "ERR";
+  int code = http.GET();
+  if (code == 200) {
+    reply = http.getString();
+    reply.trim();
+    if (!validReply(reply)) reply = "ERR";
+  }
+  http.end();
+  return reply;
+}
+
+void handleLine(String line) {
+  line.trim();
+  if (!line.startsWith("T,")) return;   // not for us (noise)
+  String d = line.substring(2);
+  for (unsigned i = 0; i < d.length(); i++) if (!isDigit(d[i])) return;
+  if (d.length() == 0 || d.length() > 4) return;
+  led(true);
+  String reply = askBackend(d);
+  led(false);
+  Serial.println(reply);
+}
+
+String lineBuf;
+
+// ---------------------------------------------------------------- main
+void setup() {
+  // Optional: if the board keeps resetting with a weak supply you *can* disable the brownout
+  // detector, but fixing the power (5 V, >= 1 A, short thick wires) is the real solution.
+  // #include "soc/rtc_cntl_reg.h"  +  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  pinMode(LED_PIN, OUTPUT);
+  led(false);
+
+  Serial.begin(9600);                   // UART0 = link to Arduino
+  Serial.setDebugOutput(false);
+  esp_log_level_set("*", ESP_LOG_NONE);
+  lineBuf.reserve(40);
+
+  if (!initCamera()) {
+    unsigned long t = millis();
+    while (millis() - t < 10000) { blink(2, 80, 80); delay(500); }
+    ESP.restart();
+  }
+  connectWiFi();
+  MDNS.begin(MDNS_NAME);
+  startServers();
+}
+
+void loop() {
+  maintainWiFi();
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') { handleLine(lineBuf); lineBuf = ""; }
+    else if (c != '\r' && lineBuf.length() < 32) lineBuf += c;
+  }
+  delay(2);
+}

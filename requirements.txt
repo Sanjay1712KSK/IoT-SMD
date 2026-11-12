@@ -1,0 +1,16 @@
+# Core backend (tested on Windows 11, Python 3.14). Works on macOS / Python 3.10+ as well.
+fastapi==0.162.5
+uvicorn==0.54.0
+python-multipart==0.0.33
+python-dotenv==1.2.4
+requests==2.34.2
+numpy==2.5.4
+# "headless" = no GUI windows needed; also avoids conflicts with other OpenCV installs.
+opencv-python-headless==5.0.0.93
+
+# Tools / tests
+pyserial==3.5
+pytest==9.2.0
+httpx==0.28.1
+
+# OPTIONAL dlib backend: see requirements-dlib.txt (needs CMake + a C++ compiler).

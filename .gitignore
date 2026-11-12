@@ -1,0 +1,26 @@
+# secrets
+.env
+firmware/esp32_cam/esp32_cam/secrets.h
+
+# personal data: face photos, snapshots, event history
+faces/*
+!faces/.gitkeep
+snapshots/*
+!snapshots/.gitkeep
+data/
+
+# downloaded models (auto-downloaded on first run)
+models/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
