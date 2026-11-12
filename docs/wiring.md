@@ -6,8 +6,8 @@
 |---|---|---|---|
 | **HC-SR04** | VCC | Arduino 5V | |
 | | GND | Arduino GND | |
-| | TRIG | Arduino **D7** | |
-| | ECHO | Arduino **D6** | 5 V output, fine for the Uno |
+| | TRIG | Arduino **D6** | TRIG/ECHO may be swapped: the sketch detects it at start-up |
+| | ECHO | Arduino **D5** | 5 V output, fine for the Uno |
 | **PIR** (optional) | VCC | Arduino 5V | needs ~30–60 s to settle after power-up |
 | | GND | Arduino GND | |
 | | OUT | Arduino **D2** | set `PIR_MODE` in the sketch to use it |
@@ -20,9 +20,15 @@
 | **ESP32-CAM** | 5V | **5 V supply, ≥1 A** | see "Power" below |
 | | GND | supply GND **and** Arduino GND | **common ground is mandatory** |
 | | U0T (GPIO1) | Arduino **D10** (SoftwareSerial RX) | direct wire (3.3 V is read as HIGH) |
-| | U0R (GPIO3) | Arduino **D11** (SoftwareSerial TX) **via divider** | **1 kΩ + 2 kΩ divider (below)** |
+| | U0R (GPIO3) | Arduino **D11** | **direct wire** with the default open-drain mode (no resistors); divider only if `ESP_TX_OPEN_DRAIN = false` |
 
 ### Level shifting (Arduino TX → ESP32 RX)
+
+**Default: no resistors needed.** The sketch uses *open-drain* signalling on D11: for a 0 bit it pulls the
+line to GND, for a 1 bit it releases the pin (high impedance) and the ESP32's internal pull-up
+(enabled in the ESP32 firmware) lifts the line to 3.3 V. The Arduino never drives 5 V onto the ESP32.
+
+**Alternative (classic):** set `ESP_TX_OPEN_DRAIN = false` and use a resistor divider:
 
 The Uno outputs 5 V, but ESP32 pins are 3.3 V only. Put a voltage divider on that one line:
 
@@ -51,19 +57,19 @@ The ESP32-CAM draws 300–400 mA spikes when WiFi transmits. Powered from a weak
 ```mermaid
 flowchart LR
   subgraph Arduino_Uno[Arduino Uno]
-    D7; D6; D2; D8; A4; A5; D10; D11; V5[5V]; GND
+    D6; D5; D2; D8; A4; A5; D10; D11; V5[5V]; GND
   end
   subgraph ESP[ESP32-CAM]
     U0T[U0T / GPIO1]; U0R[U0R / GPIO3]; E5V[5V]; EGND[GND]
   end
-  US[HC-SR04] -- TRIG --> D7
-  US -- ECHO --> D6
+  US[HC-SR04] -- TRIG --> D6
+  US -- ECHO --> D5
   PIR[PIR] -- OUT --> D2
   D8 --> BUZ[Buzzer]
   A4 -- SDA --> LCD[LCD 16x2 I2C]
   A5 -- SCL --> LCD
   U0T -- "3.3V, direct" --> D10
-  D11 -- "1k/2k divider" --> U0R
+  D11 -- "direct (open-drain)" --> U0R
   PSU[5V 2A supply] --> E5V
   PSU -.GND.- EGND
   EGND -.common GND.- GND
@@ -73,13 +79,13 @@ ASCII version:
 
 ```
                  +-----------------------+
-   HC-SR04 TRIG--| D7                 5V |--+-- HC-SR04 VCC, PIR VCC, LCD VCC
-   HC-SR04 ECHO--| D6                GND |--+-- all GNDs (incl. ESP32-CAM GND!)
+   HC-SR04 TRIG--| D6                 5V |--+-- HC-SR04 VCC, PIR VCC, LCD VCC
+   HC-SR04 ECHO--| D5                GND |--+-- all GNDs (incl. ESP32-CAM GND!)
        PIR OUT --| D2                 A4 |---- LCD SDA
     Buzzer (+) --| D8                 A5 |---- LCD SCL
                  |                       |
   ESP U0T(IO1) --| D10 (RX)              |
-  ESP U0R(IO3) <-| D11 (TX) via 1k/2k    |
+  ESP U0R(IO3) <-| D11 (TX, open-drain)  |
                  +----- Arduino Uno -----+
 
    5V 2A supply ---- ESP32-CAM 5V      supply GND ---- ESP32-CAM GND ---- Arduino GND

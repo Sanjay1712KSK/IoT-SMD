@@ -48,7 +48,7 @@ sequenceDiagram
 | PIR sensor (optional) | extra wake-up condition |
 | 16x2 LCD with I2C backpack (0x27) | status |
 | Buzzer (active) | alarm |
-| 1 kΩ + 2 kΩ resistors | 5 V → 3.3 V divider on Arduino TX → ESP32 RX |
+| (optional) 1 kΩ + 2 kΩ resistors | not needed by default: D11 uses open-drain signalling (see docs/wiring.md) |
 | 5 V ≥1 A supply for the ESP32-CAM | prevents brownout resets |
 | Laptop (Windows or macOS) on the same WiFi | runs the backend |
 
@@ -207,7 +207,7 @@ All endpoints except `/` and `/health` need the token, as header `X-Token: ...` 
 | ESP32-CAM keeps rebooting, LED restarts, "Brownout detector was triggered" | Power. Use a 5 V ≥1 A supply on the 5V pin, short wires, common GND. Not the 3.3 V pin. |
 | Arduino LCD always "No server reply" | ESP32 gets no answer: check `BACKEND_URL` IP/port in `secrets.h`, `API_TOKEN` matches `.env`, laptop firewall (below), both on the same WiFi. Open `http://<laptop-ip>:8000/health` from your phone to test. |
 | Arduino never gets any reply, ESP32 works in a browser | Serial wiring: ESP U0T→D10, D11→divider→U0R, **common GND**. MB board removed? Baud 9600 both sides? |
-| Garbage / ESP32 damaged risk | Never connect Arduino D11 straight to U0R: use the 1k/2k divider. |
+| ESP32 never receives the Arduino's `T,...` | Default open-drain mode: D11 → U0R direct, no divider (a divider breaks open-drain). With `ESP_TX_OPEN_DRAIN = false` you need the 1k/2k divider. |
 | Upload to ESP32 fails | IO0 to GND + RST for flash mode; disconnect Arduino from U0R/U0T while flashing. See docs/wiring.md. |
 | ESP32 never connects to WiFi (fast blinking forever) | 2.4 GHz only; check SSID/password; campus/"guest" WiFi often blocks devices talking to each other → use a **phone hotspot** (iPhone: turn on "Maximize Compatibility"). |
 | Web app shows "camera offline" | `STREAM_URL` wrong, or another client (a browser tab) is holding the ESP32 stream: the ESP32 serves one stream at a time well. Close other viewers; use the web app's feed instead. |

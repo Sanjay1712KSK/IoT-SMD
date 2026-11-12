@@ -24,6 +24,7 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
@@ -247,6 +248,9 @@ void setup() {
   led(false);
 
   Serial.begin(9600);                   // UART0 = link to Arduino
+  // The Arduino sends "open-drain" (only pulls the line LOW, never drives 5 V), so the ESP32's
+  // internal pull-up provides the HIGH level (3.3 V) on U0R. This is why no resistors are needed.
+  gpio_pullup_en(GPIO_NUM_3);
   Serial.setDebugOutput(false);
   esp_log_level_set("*", ESP_LOG_NONE);
   lineBuf.reserve(40);

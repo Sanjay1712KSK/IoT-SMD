@@ -20,12 +20,20 @@
 #include <SoftwareSerial.h>
 
 // ============================ PINS & SETTINGS (edit here) ============================
-const uint8_t PIN_TRIG    = 7;    // HC-SR04 TRIG
-const uint8_t PIN_ECHO    = 6;    // HC-SR04 ECHO
+// HC-SR04 on D5/D6. If TRIG and ECHO are swapped in the wiring, the sketch notices at start-up and swaps them.
+const uint8_t PIN_TRIG    = 6;    // HC-SR04 TRIG
+const uint8_t PIN_ECHO    = 5;    // HC-SR04 ECHO
 const uint8_t PIN_PIR     = 2;    // PIR OUT (only used if PIR_MODE != 0)
 const uint8_t PIN_BUZZER  = 8;    // buzzer + (other leg to GND)
 const uint8_t PIN_ESP_RX  = 10;   // Arduino RX  <- ESP32-CAM U0T (GPIO1). Direct wire is OK (3.3 V reads as HIGH).
-const uint8_t PIN_ESP_TX  = 11;   // Arduino TX  -> ESP32-CAM U0R (GPIO3) THROUGH the 1k/2k divider (5 V -> 3.3 V)!
+const uint8_t PIN_ESP_TX  = 11;   // Arduino TX  -> ESP32-CAM U0R (GPIO3). Direct wire in OPEN_DRAIN mode (below).
+const uint8_t PIN_UNUSED  = 12;   // SoftwareSerial needs a TX pin; we don't use it (keep D12 free)
+
+// How D11 talks to the 3.3 V ESP32:
+//   true  = "open-drain", NO resistors needed: we only ever pull the line to GND (bit 0) or let go (bit 1);
+//           the ESP32's internal pull-up then holds the line at 3.3 V, so 5 V never reaches the ESP32.
+//   false = normal 5 V serial output -> you MUST use the 1k/2k voltage divider (docs/wiring.md).
+const bool ESP_TX_OPEN_DRAIN = true;
 // LCD: I2C on A4 (SDA) / A5 (SCL). Common addresses are 0x27 and 0x3F.
 const uint8_t LCD_ADDR    = 0x27;
 
@@ -44,6 +52,10 @@ const uint8_t PIR_MODE = 0;
 
 const bool BUZZER_IS_PASSIVE = false;  // true if your buzzer needs tone() (no built-in oscillator)
 
+// Print the filtered distance to the USB Serial Monitor (115200) twice a second. Handy for checking
+// the HC-SR04 wiring; set to false once everything works.
+const bool DEBUG_DISTANCE = true;
+
 // ESP_LINK_USB = 1: talk to the "ESP32" over the USB cable (hardware Serial) instead of pins 10/11.
 // Used for testing with tools/fake_esp32.py --serial COMx (no ESP32 needed). Debug prints are then off.
 #define ESP_LINK_USB 0
@@ -53,7 +65,8 @@ const bool BUZZER_IS_PASSIVE = false;  // true if your buzzer needs tone() (no b
   #define ESP_LINK Serial
   #define DBG(x)
 #else
-  SoftwareSerial espSerial(PIN_ESP_RX, PIN_ESP_TX);
+  // RX on D10. Sending is done by espSendLine() below (open-drain on D11, or SoftwareSerial).
+  SoftwareSerial espSerial(PIN_ESP_RX, ESP_TX_OPEN_DRAIN ? PIN_UNUSED : PIN_ESP_TX);
   #define ESP_LINK espSerial
   #define DBG(x) Serial.println(x)
 #endif
@@ -62,6 +75,9 @@ LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 
 enum State { IDLE, WAITING, SHOWING };
 State state = IDLE;
+
+// --- ultrasonic pins (may be swapped by detectUltrasonicPins())
+uint8_t pinTrig = PIN_TRIG, pinEcho = PIN_ECHO;
 
 // --- distance filtering
 int samples[5] = {MAX_CM, MAX_CM, MAX_CM, MAX_CM, MAX_CM};
@@ -122,14 +138,89 @@ void updateBuzzer(unsigned long now) {
   if (beepToggles == 0) setBuzzer(false);
 }
 
+// ---------------------------------------------------------------------------- sending to the ESP32
+#if !ESP_LINK_USB
+// Open-drain software UART at 9600 baud (8N1). Uses the port registers directly because
+// pinMode()/digitalWrite() are too slow for accurate 104 us bit timing.
+volatile uint8_t* odDdr;
+uint8_t odMask;
+
+void odInit() {
+  digitalWrite(PIN_ESP_TX, LOW);   // PORT bit = 0: "input" means floating (no 5 V pull-up), "output" means GND
+  pinMode(PIN_ESP_TX, INPUT);      // released = idle = logic 1 (ESP32 pull-up)
+  odDdr = portModeRegister(digitalPinToPort(PIN_ESP_TX));
+  odMask = digitalPinToBitMask(PIN_ESP_TX);
+}
+
+inline void odBit(bool one) {
+  if (one) *odDdr &= ~odMask;      // input  -> released -> ESP32 pulls it to 3.3 V
+  else     *odDdr |= odMask;       // output -> driven LOW (0 V)
+}
+
+void odWriteByte(uint8_t b) {
+  const unsigned int BIT_US = 103; // 1/9600 s = 104.2 us, minus ~1 us of loop overhead
+  noInterrupts();                  // keep bit timing exact (~1 ms per byte)
+  odBit(false); delayMicroseconds(BIT_US);                 // start bit
+  for (uint8_t i = 0; i < 8; i++) { odBit(b & 1); b >>= 1; delayMicroseconds(BIT_US); }  // LSB first
+  odBit(true); delayMicroseconds(BIT_US);                  // stop bit
+  interrupts();
+}
+#endif
+
+void espSendLine(const char* s) {
+#if ESP_LINK_USB
+  Serial.println(s);
+#else
+  if (ESP_TX_OPEN_DRAIN) {
+    while (*s) odWriteByte(*s++);
+    odWriteByte('\n');
+  } else {
+    espSerial.println(s);
+  }
+#endif
+}
+
 // ---------------------------------------------------------------------------- ultrasonic
+// After a trigger pulse, the HC-SR04 always raises ECHO within ~0.5 ms (even with nothing in front).
+// If the pin we think is ECHO never goes HIGH, TRIG/ECHO are probably swapped in the wiring.
+bool echoResponds(uint8_t trig, uint8_t echo) {
+  pinMode(trig, OUTPUT);
+  pinMode(echo, INPUT);
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    delay(70);                                  // let any previous echo finish
+    if (digitalRead(echo) == HIGH) return false;
+    digitalWrite(trig, HIGH); delayMicroseconds(10); digitalWrite(trig, LOW);
+    unsigned long t = micros();
+    bool rose = false;
+    while (micros() - t < 3000) if (digitalRead(echo) == HIGH) { rose = true; break; }
+    if (!rose) return false;
+  }
+  return true;                                  // 3 out of 3 -> confident
+}
+
+void detectUltrasonicPins() {
+  if (echoResponds(PIN_TRIG, PIN_ECHO)) {
+    DBG(F("HC-SR04 found (wired as expected)"));
+  } else if (echoResponds(PIN_ECHO, PIN_TRIG)) {
+    pinTrig = PIN_ECHO; pinEcho = PIN_TRIG;     // wiring is the other way round -> swap in software
+    DBG(F("HC-SR04 TRIG/ECHO were swapped - fixed in software"));
+  } else {
+    pinMode(PIN_TRIG, OUTPUT); pinMode(PIN_ECHO, INPUT);
+    DBG(F("HC-SR04 NOT responding - check VCC/GND and the two signal wires"));
+  }
+#if !ESP_LINK_USB
+  Serial.print(F("Ultrasonic pins: TRIG=D")); Serial.print(pinTrig);
+  Serial.print(F(" ECHO=D")); Serial.println(pinEcho);
+#endif
+}
+
 int readDistanceOnce() {
-  digitalWrite(PIN_TRIG, LOW);
+  digitalWrite(pinTrig, LOW);
   delayMicroseconds(2);
-  digitalWrite(PIN_TRIG, HIGH);
+  digitalWrite(pinTrig, HIGH);
   delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
-  unsigned long us = pulseIn(PIN_ECHO, HIGH, 25000UL);  // 25 ms timeout ~ 4 m max
+  digitalWrite(pinTrig, LOW);
+  unsigned long us = pulseIn(pinEcho, HIGH, 25000UL);  // 25 ms timeout ~ 4 m max
   if (us == 0) return MAX_CM;                           // no echo = nothing in range
   int cm = us / 58;                                     // speed of sound: 58 us per cm (round trip)
   return cm > MAX_CM ? MAX_CM : cm;
@@ -173,9 +264,10 @@ bool shouldTrigger(unsigned long now) {
 void sendTrigger(unsigned long now) {
   while (ESP_LINK.available()) ESP_LINK.read();  // drop stale bytes
   lineLen = 0;
-  ESP_LINK.print("T,");
-  ESP_LINK.println(distanceCm);
-  DBG(String("-> T,") + distanceCm);
+  char msg[12];
+  snprintf(msg, sizeof(msg), "T,%d", distanceCm);
+  espSendLine(msg);
+  DBG(msg);
   state = WAITING;
   sentAt = now;
   lastTriggerAt = now;
@@ -229,8 +321,10 @@ void setup() {
   Serial.begin(115200);                         // USB debug output
 #endif
   ESP_LINK.begin(9600);
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
+#if !ESP_LINK_USB
+  if (ESP_TX_OPEN_DRAIN) odInit();
+#endif
+  detectUltrasonicPins();
   pinMode(PIN_PIR, INPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   setBuzzer(false);
@@ -259,6 +353,9 @@ void loop() {
         sendTrigger(now);
       } else if (now - lastLcdAt >= 500) {      // refresh idle screen twice a second
         lastLcdAt = now;
+#if !ESP_LINK_USB
+        if (DEBUG_DISTANCE) { Serial.print(F("dist=")); Serial.print(distanceCm); Serial.print(F(" close=")); Serial.println(closeCount); }
+#endif
         char buf[17];
         lcdLine(0, inCooldown(now) ? "Smart Door (zz)" : "Smart Door");
         if (distanceCm >= MAX_CM) snprintf(buf, sizeof(buf), "Dist: ---");
