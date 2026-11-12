@@ -25,6 +25,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
@@ -54,10 +56,14 @@
 #ifndef DEBUG_SERIAL
 #define DEBUG_SERIAL 0
 #endif
-#if DEBUG_SERIAL
-  #define DLOG(...) do { Serial.printf(__VA_ARGS__); Serial.flush(); } while (0)
-#else
-  #define DLOG(...) do {} while (0)
+// Status lines ("LOG:...") are printed in BOTH modes. The Arduino ignores any line it does not know,
+// so they are harmless on the 9600 link and make problems visible: python tools/flash.py monitor --port COMx
+#define DLOG(...) do { Serial.print("LOG:"); Serial.printf(__VA_ARGS__); Serial.flush(); } while (0)
+
+// Weak 5 V supplies (e.g. powered through the Arduino + breadboard) dip when the camera/WiFi start, which
+// trips the brownout detector and reboots the board in a loop. 1 = ignore those dips (common ESP32-CAM fix).
+#ifndef DISABLE_BROWNOUT
+#define DISABLE_BROWNOUT 1
 #endif
 
 #ifndef MDNS_NAME
@@ -208,6 +214,7 @@ void maintainWiFi() {
   if (now - lastSlowBlink >= 500) { lastSlowBlink = now; digitalWrite(LED_PIN, !digitalRead(LED_PIN)); }
   if (now - lastWifiCheck >= 10000) {    // nudge a reconnect every 10 s
     lastWifiCheck = now;
+    DLOG("WiFi not connected (status %d), retrying\n", (int)WiFi.status());
     WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
@@ -252,9 +259,9 @@ String lineBuf;
 
 // ---------------------------------------------------------------- main
 void setup() {
-  // Optional: if the board keeps resetting with a weak supply you *can* disable the brownout
-  // detector, but fixing the power (5 V, >= 1 A, short thick wires) is the real solution.
-  // #include "soc/rtc_cntl_reg.h"  +  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+#if DISABLE_BROWNOUT
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // must be first: see DISABLE_BROWNOUT above
+#endif
   pinMode(LED_PIN, OUTPUT);
   led(false);
 
@@ -262,9 +269,6 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   delay(200);
-  DLOG("\n=== ESP32-CAM debug build ===\nlast reset reason: %d (1=power-on 3=sw 4=panic 5/6/7=watchdog 9=BROWNOUT)\n",
-       (int)esp_reset_reason());
-  DLOG("PSRAM found: %s, free heap: %u\n", psramFound() ? "yes" : "NO", (unsigned)ESP.getFreeHeap());
 #else
   Serial.begin(9600);                   // UART0 = link to Arduino
   // The Arduino sends "open-drain" (only pulls the line LOW, never drives 5 V), so the ESP32's
@@ -274,6 +278,9 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_NONE);
 #endif
   lineBuf.reserve(40);
+  DLOG("boot, last reset reason: %d (1=power-on 3=sw 4=panic 5/6/7=watchdog 9=BROWNOUT)\n",
+       (int)esp_reset_reason());
+  DLOG("PSRAM found: %s, free heap: %u\n", psramFound() ? "yes" : "NO", (unsigned)ESP.getFreeHeap());
 
   DLOG("camera init...\n");
   if (!initCamera()) {
