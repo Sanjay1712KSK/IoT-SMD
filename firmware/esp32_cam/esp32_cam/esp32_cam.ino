@@ -221,6 +221,17 @@ void connectWiFi() {
   while (wifiMulti.run(5000) != WL_CONNECTED && millis() - start < 30000) blink(2, 50, 150);
 }
 
+// Troubleshooting aid: list the 2.4 GHz networks the ESP32 can see (5 GHz networks never show up).
+void logVisibleNetworks() {
+  int n = WiFi.scanNetworks();
+  DLOG("networks visible: %d\n", n);
+  for (int i = 0; i < n && i < 12; i++) {
+    DLOG("  '%s'  signal %d dBm  channel %d  security %d\n",
+         WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i), (int)WiFi.encryptionType(i));
+  }
+  WiFi.scanDelete();
+}
+
 void announceIP() {
   Serial.print("IP:");
   Serial.println(WiFi.localIP());
@@ -242,6 +253,7 @@ void maintainWiFi() {
   if (now - lastWifiCheck >= 10000) {    // nudge a reconnect every 10 s
     lastWifiCheck = now;
     DLOG("WiFi not connected (status %d), retrying\n", (int)WiFi.status());
+    logVisibleNetworks();
     wifiMulti.run(5000);
   }
 }
