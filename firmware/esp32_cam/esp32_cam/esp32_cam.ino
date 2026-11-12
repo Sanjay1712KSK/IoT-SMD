@@ -49,6 +49,17 @@
 #define PCLK_GPIO_NUM     22
 #define LED_PIN           33   // small red LED, active LOW
 
+// DEBUG_SERIAL 1 = troubleshooting build: Serial at 115200 with step-by-step messages and the reason for the
+// last reset. NOT for normal use (the Arduino link needs the quiet 9600 baud mode). `python tools/flash.py esp32 --debug`
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL 0
+#endif
+#if DEBUG_SERIAL
+  #define DLOG(...) do { Serial.printf(__VA_ARGS__); Serial.flush(); } while (0)
+#else
+  #define DLOG(...) do {} while (0)
+#endif
+
 #ifndef MDNS_NAME
 #define MDNS_NAME "doorcam"     // -> http://doorcam.local:81/stream
 #endif
@@ -247,22 +258,37 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   led(false);
 
+#if DEBUG_SERIAL
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  delay(200);
+  DLOG("\n=== ESP32-CAM debug build ===\nlast reset reason: %d (1=power-on 3=sw 4=panic 5/6/7=watchdog 9=BROWNOUT)\n",
+       (int)esp_reset_reason());
+  DLOG("PSRAM found: %s, free heap: %u\n", psramFound() ? "yes" : "NO", (unsigned)ESP.getFreeHeap());
+#else
   Serial.begin(9600);                   // UART0 = link to Arduino
   // The Arduino sends "open-drain" (only pulls the line LOW, never drives 5 V), so the ESP32's
   // internal pull-up provides the HIGH level (3.3 V) on U0R. This is why no resistors are needed.
   gpio_pullup_en(GPIO_NUM_3);
   Serial.setDebugOutput(false);
   esp_log_level_set("*", ESP_LOG_NONE);
+#endif
   lineBuf.reserve(40);
 
+  DLOG("camera init...\n");
   if (!initCamera()) {
+    DLOG("CAMERA INIT FAILED (ribbon cable? power?)\n");
     unsigned long t = millis();
     while (millis() - t < 10000) { blink(2, 80, 80); delay(500); }
     ESP.restart();
   }
+  DLOG("camera OK, connecting to WiFi '%s'...\n", WIFI_SSID);
   connectWiFi();
+  DLOG("WiFi status %d (3=connected, 1=SSID not found, 4=wrong password/failed, 6=disconnected), IP %s\n",
+       (int)WiFi.status(), WiFi.localIP().toString().c_str());
   MDNS.begin(MDNS_NAME);
   startServers();
+  DLOG("servers started: http://%s:81/stream\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {

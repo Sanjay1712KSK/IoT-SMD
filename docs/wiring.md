@@ -123,6 +123,8 @@ Uploading works with the ESP32 connected (it uses pins 10/11, not 0/1).
 |---|---|
 | Board | **AI Thinker ESP32-CAM** |
 | Partition Scheme | Huge APP (3MB No OTA/1MB SPIFFS) (default for this board) |
+| Flash Mode | **DIO** (QIO makes many clones reboot every second) |
+| Flash Frequency | **40MHz** |
 | Upload Speed | 115200 (try 460800 if it works reliably) |
 | Core Debug Level | **None** (important: UART0 is the Arduino link) |
 | PSRAM | Enabled (fixed on this board) |
@@ -157,6 +159,7 @@ Uploading works with the ESP32 connected (it uses pins 10/11, not 0/1).
 | Error | Fix |
 |---|---|
 | `Failed to connect to ESP32: No serial data received` / `Timed out waiting for packet header` | Not in flash mode: IO0 must be at GND while pressing RST. Check TX↔RX are crossed. |
+| Reboots about once per second right after `entry 0x400805b4`, `rst:0x3 (SW_RESET)` | Flash Mode QIO / 80 MHz not supported by the clone: use **DIO** and **40MHz**, re-upload. |
 | `Brownout detector was triggered` (in Serial Monitor at 115200) | Power problem: better 5 V supply, shorter wires. |
 | `Camera init failed` / LED rapid double blink | Ribbon cable not seated: lift the black latch, reseat the camera, close the latch. |
 | Upload works, but nothing happens | You left IO0 on GND. Remove it, press RST. |

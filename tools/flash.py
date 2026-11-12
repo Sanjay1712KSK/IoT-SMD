@@ -26,7 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ARDUINO_SKETCH = ROOT / "firmware" / "arduino" / "door_arduino"
 ESP32_SKETCH = ROOT / "firmware" / "esp32_cam" / "esp32_cam"
-FQBN = {"arduino": "arduino:avr:uno", "esp32": "esp32:esp32:esp32cam"}
+# ESP32-CAM clones often boot-loop with the default QIO/80 MHz flash settings -> use DIO/40 MHz (always safe).
+# DebugLevel=error: only real errors are printed (at boot, before our code switches the UART to 9600).
+FQBN = {"arduino": "arduino:avr:uno",
+        "esp32": "esp32:esp32:esp32cam:FlashMode=dio,FlashFreq=40,DebugLevel=error"}
 
 
 def cli() -> list[str]:
@@ -56,7 +59,7 @@ def short_build_dir() -> str:
     return d
 
 
-def flash(target: str, port: str | None, build_only: bool, usb_link: bool) -> None:
+def flash(target: str, port: str | None, build_only: bool, usb_link: bool, debug: bool = False) -> None:
     sketch = ARDUINO_SKETCH if target == "arduino" else ESP32_SKETCH
     if target == "esp32" and not (sketch / "secrets.h").exists():
         sys.exit(f"Missing {sketch / 'secrets.h'}: copy secrets.h.example and fill it in.")
@@ -68,7 +71,13 @@ def flash(target: str, port: str | None, build_only: bool, usb_link: bool) -> No
         (tmp / "door_arduino.ino").write_text(src.replace("#define ESP_LINK_USB 0", "#define ESP_LINK_USB 1"),
                                               encoding="utf-8")
         sketch = tmp
-    build = short_build_dir() + "_" + target
+    if debug and target == "esp32":  # copy with DEBUG_SERIAL 1 (115200 baud step-by-step messages)
+        tmp = Path(tempfile.mkdtemp()) / "esp32_cam"
+        shutil.copytree(sketch, tmp)
+        ino = tmp / "esp32_cam.ino"
+        ino.write_text("#define DEBUG_SERIAL 1\n" + ino.read_text(encoding="utf-8"), encoding="utf-8")
+        sketch = tmp
+    build = short_build_dir() + "_" + target + ("_debug" if debug else "")
     run(["compile", "-b", FQBN[target], "--build-path", build, str(sketch)])
     if build_only:
         return
@@ -76,7 +85,8 @@ def flash(target: str, port: str | None, build_only: bool, usb_link: bool) -> No
         sys.exit("--port is required to upload (see: python tools/flash.py ports)")
     if target == "esp32":
         print("\nESP32-CAM: make sure it is in flash mode (IO0 to GND, then press RST; MB board: hold IO0, tap RST).")
-    run(["upload", "-b", FQBN[target], "-p", port, "--input-dir", build, str(sketch)])
+    extra = ["--upload-property", "upload.speed=115200"] if target == "esp32" else []  # slow = reliable via the Uno
+    run(["upload", "-b", FQBN[target], "-p", port, "--input-dir", build, *extra, str(sketch)])
     if target == "esp32":
         print("\nDone. Now remove the IO0-GND link (if any) and press RST. Then: python tools/flash.py monitor --port", port)
 
@@ -101,6 +111,7 @@ def main() -> None:
     ap.add_argument("--build-only", action="store_true")
     ap.add_argument("--usb-link", action="store_true", help="Arduino: ESP_LINK_USB=1 (for fake_esp32 --serial)")
     ap.add_argument("--baud", type=int, default=9600)
+    ap.add_argument("--debug", action="store_true", help="ESP32: troubleshooting build, messages at 115200")
     a = ap.parse_args()
     if a.target == "ports":
         run(["board", "list"])
@@ -109,7 +120,7 @@ def main() -> None:
             sys.exit("--port required")
         monitor(a.port, a.baud)
     else:
-        flash(a.target, a.port, a.build_only, a.usb_link)
+        flash(a.target, a.port, a.build_only, a.usb_link, a.debug)
 
 
 if __name__ == "__main__":
