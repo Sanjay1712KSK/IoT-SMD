@@ -28,6 +28,8 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include <WiFi.h>
+#include <WiFiMulti.h>
+#include "lwip/sockets.h"
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include "secrets.h"   // copy secrets.h.example -> secrets.h and fill in (not committed to git)
@@ -66,11 +68,20 @@
 #define DISABLE_BROWNOUT 1
 #endif
 
+#ifndef BACKEND_PORT
+#define BACKEND_PORT 8000
+#endif
+
 #ifndef MDNS_NAME
 #define MDNS_NAME "doorcam"     // -> http://doorcam.local:81/stream
 #endif
 
 static const unsigned long HTTP_TIMEOUT_MS = 6000;   // Arduino waits 10 s, so stay well below that
+
+// The backend is the client that watches /stream, so we remember its IP and send triggers there.
+// This means the laptop's IP never has to be typed in. BACKEND_URL is only the fallback.
+volatile uint32_t streamClientIp = 0;
+WiFiMulti wifiMulti;
 
 httpd_handle_t streamHttpd = NULL;
 httpd_handle_t webHttpd = NULL;
@@ -126,8 +137,17 @@ static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" P
 static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+static void rememberStreamClient(httpd_req_t* req) {
+  struct sockaddr_storage ss;
+  socklen_t len = sizeof(ss);
+  if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr*)&ss, &len) != 0) return;
+  if (ss.ss_family == AF_INET) streamClientIp = ((struct sockaddr_in*)&ss)->sin_addr.s_addr;
+  else if (ss.ss_family == AF_INET6) streamClientIp = ((struct sockaddr_in6*)&ss)->sin6_addr.un.u32_addr[3];  // IPv4-mapped
+}
+
 static esp_err_t streamHandler(httpd_req_t* req) {
   char partBuf[64];
+  rememberStreamClient(req);
   esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
   if (res != ESP_OK) return res;
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -189,9 +209,16 @@ void connectWiFi() {
   ip.fromString(STATIC_IP); gw.fromString(STATIC_GATEWAY);
   WiFi.config(ip, gw, mask, gw);
 #endif
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Up to 3 networks (secrets.h): joins whichever is in range, strongest first.
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+#ifdef WIFI_SSID2
+  wifiMulti.addAP(WIFI_SSID2, WIFI_PASSWORD2);
+#endif
+#ifdef WIFI_SSID3
+  wifiMulti.addAP(WIFI_SSID3, WIFI_PASSWORD3);
+#endif
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) blink(1, 50, 150);
+  while (wifiMulti.run(5000) != WL_CONNECTED && millis() - start < 30000) blink(2, 50, 150);
 }
 
 void announceIP() {
@@ -215,8 +242,7 @@ void maintainWiFi() {
   if (now - lastWifiCheck >= 10000) {    // nudge a reconnect every 10 s
     lastWifiCheck = now;
     DLOG("WiFi not connected (status %d), retrying\n", (int)WiFi.status());
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiMulti.run(5000);
   }
 }
 
@@ -228,7 +254,10 @@ bool validReply(const String& r) {
 String askBackend(const String& distance) {
   if (WiFi.status() != WL_CONNECTED) return "ERR";
   HTTPClient http;
-  String url = String(BACKEND_URL) + "/trigger?d=" + distance + "&token=" + API_TOKEN;
+  String base = streamClientIp ? "http://" + IPAddress(streamClientIp).toString() + ":" + String(BACKEND_PORT)
+                               : String(BACKEND_URL);
+  String url = base + "/trigger?d=" + distance + "&token=" + API_TOKEN;
+  DLOG("trigger -> %s\n", base.c_str());
   http.setConnectTimeout(3000);
   http.setTimeout(HTTP_TIMEOUT_MS);
   if (!http.begin(url)) return "ERR";
@@ -291,6 +320,7 @@ void setup() {
   }
   DLOG("camera OK, connecting to WiFi '%s'...\n", WIFI_SSID);
   connectWiFi();
+  DLOG("WiFi network: %s\n", WiFi.SSID().c_str());
   DLOG("WiFi status %d (3=connected, 1=SSID not found, 4=wrong password/failed, 6=disconnected), IP %s\n",
        (int)WiFi.status(), WiFi.localIP().toString().c_str());
   MDNS.begin(MDNS_NAME);
